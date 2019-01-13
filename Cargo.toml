@@ -1,0 +1,10 @@
+[package]
+name = "websocket-protocol"
+version = "0.1.0"
+edition = "2018"
+
+[features]
+std = []
+
+[dependencies]
+sha1 = "0.6"
