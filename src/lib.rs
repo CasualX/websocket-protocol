@@ -350,8 +350,7 @@ impl Default for FrameHeader {
 
 /// Decodes a WebSocket Frame Header from the stream.
 ///
-/// Return values
-/// -------------
+/// # Return value
 ///
 /// * Returns `Ok(n)` if a frame header was successfully decoded consuming `n` bytes from the stream.
 ///   The returned size is guaranteed to be greater than 0 and less than the stream length.
@@ -361,8 +360,7 @@ impl Default for FrameHeader {
 ///
 /// * Other errors may be returned if the header violates the WebSocket framing protocol.
 ///
-/// Examples
-/// --------
+/// # Examples
 ///
 /// A single-frame unmasked text message:
 ///
@@ -562,10 +560,10 @@ pub fn encode_frame_header(frame_header: &FrameHeader, dest: &mut [u8]) -> Resul
 /// Copies the payload from the stream to the destination buffer.
 /// If a masking key is present in the frame header the payload is unmasked.
 ///
-/// # Return values
+/// # Return value
 ///
 /// * Returns `Ok(n)` if the frame payload was successfully decoded consuming `n` bytes from the stream.
-///   The returned size is equal to the frame header's payload length.
+///   The returned size is equal to the frame header's payload_len.
 ///
 /// * Returns `Err(WouldBlock)` if the input stream does not contain at least `frame_header.payload_len` bytes.
 ///   Accumulate more data from the source before trying to decode again.
@@ -623,4 +621,95 @@ pub fn encode_frame_payload(frame_header: &FrameHeader, payload: &[u8], dest: &m
 		dest[..payload.len()].copy_from_slice(payload);
 	}
 	Ok(payload.len())
+}
+
+/// Decodes the frame payload inplace.
+///
+/// # Return value
+///
+/// * Returns `Ok(n)` if the frame payload was successfully decoded consuming `n` bytes from the stream.
+///   The returned size is equal to the payload length.
+///
+/// * Returns `Err(WouldBlock)` if the input stream does not contain at least `frame_header.payload_len` bytes.
+///   Accumulate more data from the source before trying to decode again.
+///
+/// # Examples
+///
+/// ```
+/// use websocket_protocol as wsproto;
+///
+/// // A single-frame masked text message: "Hello"
+/// let mut stream = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+///
+/// // Decode the frame header
+/// let mut frame_header = wsproto::FrameHeader::default();
+/// assert_eq!(Ok(6), wsproto::decode_frame_header(&stream, &mut frame_header));
+///
+/// // Decode the frame payload inplace
+/// assert_eq!(Ok(5), wsproto::decode_frame_payload_mut(&frame_header, &mut stream[6..]));
+/// assert_eq!(b"Hello", &stream[6..]);
+/// ```
+pub fn decode_frame_payload_mut(frame_header: &FrameHeader, stream: &mut [u8]) -> Result<usize, Error> {
+	// Verify there is enough data in the stream
+	if frame_header.payload_len > stream.len() as u64 {
+		return Err(Error::WouldBlock);
+	}
+	let stream = &mut stream[..frame_header.payload_len as usize];
+	// Unmask the payload if required
+	if let Some(masking_key) = &frame_header.masking_key {
+		for i in 0..stream.len() {
+			stream[i] ^= masking_key[i % 4];
+		}
+	}
+	Ok(stream.len())
+}
+
+/// Decodes a frame inplace calling the closure with the decoded frame header and its payload.
+///
+/// # Return value
+///
+/// * Returns `Ok(n)` if the frame was successfully decoded and the closure called consuming `n` bytes from the stream.
+///   The returned size is equal to the length of the decoded frame.
+///
+pub fn decode_frame_mut<'a, F: FnMut(&FrameHeader, &'a [u8])>(stream: &'a mut [u8], mut f: F) -> Result<usize, Error> {
+	// Decode a WebSocket frame header
+	let mut frame_header = FrameHeader::default();
+	let header_len = decode_frame_header(stream, &mut frame_header)?;
+	// Decode the WebSocket frame payload
+	let stream = &mut stream[header_len..];
+	let payload_len = decode_frame_payload_mut(&frame_header, stream)?;
+	let payload = &stream[..payload_len];
+	// Notify the caller and return the number of bytes consumed
+	f(&frame_header, payload);
+	Ok(header_len + payload_len)
+}
+
+pub fn decode_frames_mut<'a, F: FnMut(&FrameHeader, &'a [u8])>(mut stream: &'a mut [u8], mut f: F) -> Result<usize, Error> {
+	let mut consumed = 0;
+	loop {
+		// Why is this unsafe casting necessary?
+		// Since the stream's lifetime and the callback's payload are tagged with the same lifetime,
+		// Rust correctly infers that the slice could be leaked there, causing any further mutation of the stream potentially aliasing.
+		// However in our case this doesn't happen because the slices are distinct.
+		// The slice going into the closure is the next frame in the stream, but we want to keep looking for frames after that.
+		// Essentially this wants to split the stream at `frame_len` but we only know that length _after_ we call `decode_frame_mut`.
+		// Which could return the split off slices instead of just a length! But such is the consequences of the choice in API.
+		// Alternatively the two references could not be tagged with the same lifetime (ensuring the stream reference cannot leak).
+		match decode_frame_mut(unsafe { &mut *(stream as *mut _) }, &mut f) {
+			Ok(frame_len) => {
+				stream = &mut stream[frame_len..];
+				consumed += frame_len;
+			},
+			Err(err) => {
+				// Having consumed all there is from the input stream, we are satisfied
+				if err == Error::WouldBlock {
+					return Ok(consumed);
+				}
+				// Something happened, cannot proceed
+				else {
+					return Err(err);
+				}
+			},
+		}
+	}
 }
