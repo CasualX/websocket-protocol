@@ -19,6 +19,8 @@ pub mod http;
 //----------------------------------------------------------------
 
 /// WebSocket Message.
+///
+/// The message is borrowed and does not own the underlying data.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Msg<'a> {
 	Text(&'a str),
@@ -29,35 +31,42 @@ pub enum Msg<'a> {
 }
 impl<'a> Msg<'a> {
 	/// Constructs a new Msg from the given opcode and payload.
-	pub fn new(opcode: OpCode, payload: &'a [u8]) -> Result<Msg<'a>, str::Utf8Error> {
+	///
+	/// If the payload is expected to be a string, an error will be returned if the payload is not valid UTF-8.
+	///
+	/// # Panics
+	///
+	/// Panics if `opcode` has the value [`Continue`](Opcode::Continue).
+	pub fn new(opcode: Opcode, payload: &'a [u8]) -> Result<Msg<'a>, str::Utf8Error> {
 		match opcode {
-			OpCode::Continue => panic!("Cannot construct WebSocket Msg from Continue opcode"),
-			OpCode::Text => str::from_utf8(payload).map(Msg::Text),
-			OpCode::Binary => Ok(Msg::Binary(payload)),
-			OpCode::Close => if payload.len() >= 2 {
-				let close_code = (payload[0] as u16) << 8 | payload[1] as u16;
-				match str::from_utf8(&payload[2..]) {
-					Ok(reason) => Ok(Msg::Close(close_code, reason)),
-					Err(err) => Err(err),
-				}
+			Opcode::Continue => panic!("Cannot construct WebSocket Msg from Continue opcode"),
+			Opcode::Text => str::from_utf8(payload).map(Msg::Text),
+			Opcode::Binary => Ok(Msg::Binary(payload)),
+			Opcode::Close => if payload.len() >= 2 {
+				let code = (payload[0] as u16) << 8 | payload[1] as u16;
+				let reason = str::from_utf8(&payload[2..])?;
+				Ok(Msg::Close(code, reason))
 			}
 			else {
 				Ok(Msg::Close(CLOSE_NORMAL, ""))
 			},
-			OpCode::Ping => Ok(Msg::Ping(payload)),
-			OpCode::Pong => Ok(Msg::Pong(payload)),
+			Opcode::Ping => Ok(Msg::Ping(payload)),
+			Opcode::Pong => Ok(Msg::Pong(payload)),
 		}
 	}
-	pub fn opcode(&self) -> OpCode {
+	/// Returns the associated opcode for this msg.
+	pub fn opcode(&self) -> Opcode {
 		match self {
-			Msg::Text(_) => OpCode::Text,
-			Msg::Binary(_) => OpCode::Binary,
-			Msg::Close(_, _) => OpCode::Close,
-			Msg::Ping(_) => OpCode::Ping,
-			Msg::Pong(_) => OpCode::Pong,
+			Msg::Text(_) => Opcode::Text,
+			Msg::Binary(_) => Opcode::Binary,
+			Msg::Close(_, _) => Opcode::Close,
+			Msg::Ping(_) => Opcode::Ping,
+			Msg::Pong(_) => Opcode::Pong,
 		}
 	}
 }
+
+//----------------------------------------------------------------
 
 /// WebSocket Message.
 #[cfg(feature = "std")]
@@ -71,12 +80,12 @@ pub enum Message {
 }
 #[cfg(feature = "std")]
 impl Message {
-	pub fn new(opcode: OpCode, mut payload: Vec<u8>) -> Result<Message, Vec<u8>> {
+	pub fn new(opcode: Opcode, mut payload: Vec<u8>) -> Result<Message, Vec<u8>> {
 		match opcode {
-			OpCode::Continue => Err(payload),
-			OpCode::Text => String::from_utf8(payload).map(Message::Text).map_err(|err| err.into_bytes()),
-			OpCode::Binary => Ok(Message::Binary(payload)),
-			OpCode::Close => {
+			Opcode::Continue => Err(payload),
+			Opcode::Text => String::from_utf8(payload).map(Message::Text).map_err(|err| err.into_bytes()),
+			Opcode::Binary => Ok(Message::Binary(payload)),
+			Opcode::Close => {
 				if payload.len() >= 2 {
 					let close_code = (payload[0] as u16) << 8 | payload[1] as u16;
 					payload.drain(..2);
@@ -89,8 +98,8 @@ impl Message {
 					Ok(Message::Close(CLOSE_NORMAL, String::new()))
 				}
 			},
-			OpCode::Ping => Ok(Message::Ping(payload)),
-			OpCode::Pong => Ok(Message::Pong(payload)),
+			Opcode::Ping => Ok(Message::Ping(payload)),
+			Opcode::Pong => Ok(Message::Pong(payload)),
 		}
 	}
 	pub fn as_msg(&self) -> Msg<'_> {
@@ -133,7 +142,7 @@ pub const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 #[derive(Debug)]
 pub struct WebSocket {
 	fin: bool,
-	opcode: OpCode,
+	opcode: Opcode,
 	buffer: Vec<u8>,
 }
 #[cfg(feature = "std")]
@@ -179,10 +188,10 @@ impl WebSocket {
 
 //----------------------------------------------------------------
 
-/// Operation codes.
+/// Operation code.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum OpCode {
+pub enum Opcode {
 	/// Indicates a continuation frame of a fragmented message.
 	Continue = 0x0,
 	/// Indicates a text data frame.
@@ -196,12 +205,15 @@ pub enum OpCode {
 	/// Indicates a pong control frame.
 	Pong = 0xA,
 }
-impl OpCode {
+impl Opcode {
 	/// Tests whether the opcode indicates a control frame.
 	pub fn is_control(self) -> bool {
 		(self as u8 & 0x8) != 0
 	}
-	pub fn try_from(opcode: u8) -> Result<OpCode, u8> {
+	/// Try to construct an Opcode from a byte.
+	///
+	/// The opcode is returned as an error if it is not valid.
+	pub fn try_from(opcode: u8) -> Result<Opcode, u8> {
 		if (opcode & 0xF7) < 3 {
 			Ok(unsafe { mem::transmute(opcode) })
 		}
@@ -210,8 +222,8 @@ impl OpCode {
 		}
 	}
 }
-impl From<OpCode> for u8 {
-	fn from(opcode: OpCode) -> u8 {
+impl From<Opcode> for u8 {
+	fn from(opcode: Opcode) -> u8 {
 		opcode as u8
 	}
 }
@@ -238,7 +250,7 @@ pub const PAYLOAD_LEN_MIN_64: u64 = 65536;
 
 //----------------------------------------------------------------
 
-/// Serialization errors.
+/// Framing errors.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
 	/// Payload length error: [Section 5.2](https://tools.ietf.org/html/rfc6455#section-5.2).
@@ -248,7 +260,12 @@ pub enum Error {
 	/// The minimal number of bytes MUST be used to encode the length.
 	BadLength,
 	UnknownOpCode,
+	/// Control Frames: [Section 5.5](https://tools.ietf.org/html/rfc6455#section-5.5).
+	///
+	/// All control frames MUST have a payload length of 125 bytes or less and MUST NOT be fragmented.
 	BadControl,
+	/// Not enough data was provided to fully decode the input stream.
+	/// Accumulate more data in the input stream and call the function again.
 	WouldBlock,
 }
 
@@ -295,7 +312,7 @@ pub struct FrameHeader {
 	/// Defines the interpretation of the payload data.
 	///
 	/// If an unknown opcode is received, the receiving endpoint MUST _Fail the WebSocket Connection_.
-	pub opcode: OpCode,
+	pub opcode: Opcode,
 	/// Defines whether the payload data is masked.
 	///
 	/// All frames sent from client to server must be masked.
@@ -305,19 +322,25 @@ pub struct FrameHeader {
 }
 impl Default for FrameHeader {
 	fn default() -> FrameHeader {
-		unsafe { mem::zeroed() }
+		FrameHeader {
+			fin: false,
+			exts: 0,
+			opcode: Opcode::Continue,
+			masking_key: None,
+			payload_len: 0,
+		}
 	}
 }
 
 /// Decodes the frame header from the stream.
-pub fn decode_header(stream: &[u8], frame_header: &mut FrameHeader) -> Result<usize, Error> {
+pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Result<usize, Error> {
 	// Read the first two control bytes.
 	if stream.len() < 2 {
 		return Err(Error::WouldBlock);
 	}
 	frame_header.fin = (stream[0] & 0x80) != 0;
 	frame_header.exts = stream[0] & 0x70;
-	frame_header.opcode = OpCode::try_from(stream[0] & 0x0F).map_err(|_| Error::UnknownOpCode)?;
+	frame_header.opcode = Opcode::try_from(stream[0] & 0x0F).map_err(|_| Error::UnknownOpCode)?;
 
 	// All control frames MUST have a payload length of 125 bytes or less and MUST NOT be fragmented.
 	if frame_header.opcode.is_control() && (!frame_header.fin || (stream[1] & 0x7F) > 125) {
@@ -391,7 +414,7 @@ pub fn decode_header(stream: &[u8], frame_header: &mut FrameHeader) -> Result<us
 	Ok(cursor)
 }
 
-pub fn encode_header(frame_header: &FrameHeader, dest: &mut [u8]) -> Result<usize, Error> {
+pub fn encode_frame_header(frame_header: &FrameHeader, dest: &mut [u8]) -> Result<usize, Error> {
 	// The most significant bit MUST be 0
 	if (frame_header.payload_len & 0x8000_0000_0000_0000) != 0 {
 		return Err(Error::BadLength);
@@ -515,8 +538,4 @@ pub fn encode_payload(frame_header: &FrameHeader, payload: &[u8], dest: &mut [u8
 		dest[..payload.len()].copy_from_slice(payload);
 	}
 	Ok(payload.len())
-}
-
-pub fn decode_frame(stream: &[u8], frame_header: &mut FrameHeader, dest: &mut [u8]) -> Result<usize, Error> {
-	unimplemented!()
 }
