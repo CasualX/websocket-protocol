@@ -3,6 +3,10 @@ WebSocket Protocol
 ==================
 
 Defines a low-level webSocket protocol implementation without any reference to networking or async io.
+
+Examples
+--------
+
 !*/
 
 #![no_std]
@@ -147,14 +151,14 @@ pub struct WebSocket {
 }
 #[cfg(feature = "std")]
 impl WebSocket {
-	pub fn recv(&mut self, stream: &[u8]) -> Result<usize, Error> {
+	pub fn recv(&mut self, stream: &[u8], max_message_size: usize) -> Result<usize, Error> {
 		// Early reject
 		if stream.len() == 0 {
 			return Err(Error::WouldBlock);
 		}
 		// Decode the frame header
 		let mut frame_header = FrameHeader::default();
-		let frame_header_len = decode_header(stream, &mut frame_header)?;
+		let frame_header_len = decode_frame_header(stream, &mut frame_header)?;
 		// Allocate memory in the buffer for the frame
 		let start = self.buffer.len();
 		let end = start + frame_header.payload_len as usize;
@@ -164,8 +168,8 @@ impl WebSocket {
 		}
 		// Decode the payload into the buffer
 		unsafe {
-			let dest = core::slice::from_raw_parts_mut(self.buffer.as_mut_ptr().offset(start as usize), end - start);
-			decode_payload(&frame_header, &stream[frame_header_len..], dest)?;
+			let dest = core::slice::from_raw_parts_mut(self.buffer.as_mut_ptr().offset(start as isize), end - start);
+			decode_frame_payload(&frame_header, &stream[frame_header_len..], dest)?;
 			self.buffer.set_len(end);
 		}
 		// Stich together a WebSocket message
@@ -173,11 +177,17 @@ impl WebSocket {
 		
 		unimplemented!()
 	}
+	pub fn reset(&mut self) {
+		self.fin = true;
+		self.opcode = Opcode::Continue;
+		self.buffer.clear();
+	}
+	/// Returns true if a complete WebSocket message has been assembled.
 	pub fn fin(&self) -> bool {
-		self.fin
+		self.fin && self.opcode != Opcode::Continue
 	}
 	pub fn as_msg(&self) -> Option<Result<Msg<'_>, str::Utf8Error>> {
-		if self.fin {
+		if self.fin() {
 			Some(Msg::new(self.opcode, &self.buffer))
 		}
 		else {
@@ -258,13 +268,19 @@ pub enum Error {
 	/// When 64bit length, the most significant bit MUST be 0.
 	///
 	/// The minimal number of bytes MUST be used to encode the length.
-	BadLength,
-	UnknownOpCode,
+	BadPayloadLength,
+	/// Opcode: [Section 5.2](https://tools.ietf.org/html/rfc6455#section-5.2).
+	///
+	/// If an unknown opcode is received, the receiving endpoint MUST _Fail the WebSocket Connection_.
+	UnknownOpcode,
 	/// Control Frames: [Section 5.5](https://tools.ietf.org/html/rfc6455#section-5.5).
 	///
 	/// All control frames MUST have a payload length of 125 bytes or less and MUST NOT be fragmented.
-	BadControl,
-	/// Not enough data was provided to fully decode the input stream.
+	BadControlFrame,
+	UnsupportedExtension,
+	LengthMismatch,
+	/// Not enough data in the input stream.
+	///
 	/// Accumulate more data in the input stream and call the function again.
 	WouldBlock,
 }
@@ -308,7 +324,7 @@ pub struct FrameHeader {
 	/// Negotiated extension bits.
 	///
 	/// MUST be zero unless an extension is negotiated that defines meanings for non-zero values.
-	pub exts: u8,
+	pub extensions: u8,
 	/// Defines the interpretation of the payload data.
 	///
 	/// If an unknown opcode is received, the receiving endpoint MUST _Fail the WebSocket Connection_.
@@ -324,7 +340,7 @@ impl Default for FrameHeader {
 	fn default() -> FrameHeader {
 		FrameHeader {
 			fin: false,
-			exts: 0,
+			extensions: 0,
 			opcode: Opcode::Continue,
 			masking_key: None,
 			payload_len: 0,
@@ -332,19 +348,73 @@ impl Default for FrameHeader {
 	}
 }
 
-/// Decodes the frame header from the stream.
+/// Decodes a WebSocket Frame Header from the stream.
+///
+/// Return values
+/// -------------
+///
+/// * Returns `Ok(n)` if a frame header was successfully decoded consuming `n` bytes from the stream.
+///   The returned size is guaranteed to be greater than 0 and less than the stream length.
+///
+/// * Returns `Err(WouldBlock)` if there were not enough bytes in the stream to fully decode the frame header.
+///   Accumulate more data from the source before trying to decode again.
+///
+/// * Other errors may be returned if the header violates the WebSocket framing protocol.
+///
+/// Examples
+/// --------
+///
+/// A single-frame unmasked text message:
+///
+/// ```
+/// use websocket_protocol as wsproto;
+///
+/// let stream = &[0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f];
+///
+/// let mut frame_header = wsproto::FrameHeader::default();
+/// assert_eq!(Ok(2), wsproto::decode_frame_header(stream, &mut frame_header));
+///
+/// let expected_header = wsproto::FrameHeader {
+/// 	fin: true,
+/// 	extensions: 0,
+/// 	opcode: wsproto::Opcode::Text,
+/// 	masking_key: None,
+/// 	payload_len: 5,
+/// };
+/// assert_eq!(expected_header, frame_header);
+/// ```
+///
+/// A single-frame masked text message:
+///
+/// ```
+/// use websocket_protocol as wsproto;
+///
+/// let stream = &[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+///
+/// let mut frame_header = wsproto::FrameHeader::default();
+/// assert_eq!(Ok(6), wsproto::decode_frame_header(stream, &mut frame_header));
+///
+/// let expected_header = wsproto::FrameHeader {
+/// 	fin: true,
+/// 	extensions: 0,
+/// 	opcode: wsproto::Opcode::Text,
+/// 	masking_key: Some([0x37, 0xfa, 0x21, 0x3d]),
+/// 	payload_len: 5,
+/// };
+/// assert_eq!(expected_header, frame_header);
+/// ```
 pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Result<usize, Error> {
 	// Read the first two control bytes.
 	if stream.len() < 2 {
 		return Err(Error::WouldBlock);
 	}
 	frame_header.fin = (stream[0] & 0x80) != 0;
-	frame_header.exts = stream[0] & 0x70;
-	frame_header.opcode = Opcode::try_from(stream[0] & 0x0F).map_err(|_| Error::UnknownOpCode)?;
+	frame_header.extensions = stream[0] & 0x70;
+	frame_header.opcode = Opcode::try_from(stream[0] & 0x0F).map_err(|_| Error::UnknownOpcode)?;
 
 	// All control frames MUST have a payload length of 125 bytes or less and MUST NOT be fragmented.
 	if frame_header.opcode.is_control() && (!frame_header.fin || (stream[1] & 0x7F) > 125) {
-		return Err(Error::BadControl);
+		return Err(Error::BadControlFrame);
 	}
 
 	// Extract the payload length
@@ -359,7 +429,7 @@ pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Res
 			cursor += 2;
 			// The minimal number of bytes MUST be used to encode the length
 			if len < PAYLOAD_LEN_MIN_16 {
-				return Err(Error::BadLength);
+				return Err(Error::BadPayloadLength);
 			}
 			len as u64
 		},
@@ -380,11 +450,11 @@ pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Res
 			cursor += 8;
 			// The most significant bit MUST be 0
 			if (len & 0x8000_0000_0000_0000) != 0 {
-				return Err(Error::BadLength);
+				return Err(Error::BadPayloadLength);
 			}
 			// The minimal number of bytes MUST be used to encode the length
 			if len < PAYLOAD_LEN_MIN_64 {
-				return Err(Error::BadLength);
+				return Err(Error::BadPayloadLength);
 			}
 			len
 		},
@@ -405,7 +475,7 @@ pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Res
 			stream[cursor + 3],
 		];
 		cursor += 4;
-		Some(mask.into())
+		Some(mask)
 	}
 	else {
 		None
@@ -417,13 +487,13 @@ pub fn decode_frame_header(stream: &[u8], frame_header: &mut FrameHeader) -> Res
 pub fn encode_frame_header(frame_header: &FrameHeader, dest: &mut [u8]) -> Result<usize, Error> {
 	// The most significant bit MUST be 0
 	if (frame_header.payload_len & 0x8000_0000_0000_0000) != 0 {
-		return Err(Error::BadLength);
+		return Err(Error::BadPayloadLength);
 	}
 
 	// Construct the first control byte
 	let word1 =
 		if frame_header.fin { 0x80 } else { 0x00 } |
-		u8::from(frame_header.exts) |
+		u8::from(frame_header.extensions) |
 		u8::from(frame_header.opcode);
 
 	// Construct the second control byte
@@ -488,10 +558,25 @@ pub fn encode_frame_header(frame_header: &FrameHeader, dest: &mut [u8]) -> Resul
 }
 
 /// Decodes the frame payload into the destination buffer.
-pub fn decode_payload(frame_header: &FrameHeader, stream: &[u8], dest: &mut [u8]) -> Result<usize, Error> {
+///
+/// Copies the payload from the stream to the destination buffer.
+/// If a masking key is present in the frame header the payload is unmasked.
+///
+/// # Return values
+///
+/// * Returns `Ok(n)` if the frame payload was successfully decoded consuming `n` bytes from the stream.
+///   The returned size is equal to the frame header's payload length.
+///
+/// * Returns `Err(WouldBlock)` if the input stream does not contain at least `frame_header.payload_len` bytes.
+///   Accumulate more data from the source before trying to decode again.
+///
+/// * Returns `Err(LengthMismatch)` if the destination buffer length does not match the frame header's payload length.
+///   Callers are encouraged to set a reasonable frame payload size limit.
+///
+pub fn decode_frame_payload(frame_header: &FrameHeader, stream: &[u8], dest: &mut [u8]) -> Result<usize, Error> {
 	// The destination buffer must fit the payload length
 	if dest.len() as u64 != frame_header.payload_len {
-		return Err(Error::BadLength);
+		return Err(Error::LengthMismatch);
 	}
 	// Zero length payload fast path
 	if dest.len() == 0 {
@@ -514,10 +599,10 @@ pub fn decode_payload(frame_header: &FrameHeader, stream: &[u8], dest: &mut [u8]
 	Ok(dest.len())
 }
 
-pub fn encode_payload(frame_header: &FrameHeader, payload: &[u8], dest: &mut [u8]) -> Result<usize, Error> {
+pub fn encode_frame_payload(frame_header: &FrameHeader, payload: &[u8], dest: &mut [u8]) -> Result<usize, Error> {
 	// Payload must equal the payload length
 	if payload.len() as u64 != frame_header.payload_len {
-		return Err(Error::BadLength);
+		return Err(Error::LengthMismatch);
 	}
 	// Zero length payload fast path
 	if payload.len() == 0 {
@@ -525,7 +610,7 @@ pub fn encode_payload(frame_header: &FrameHeader, payload: &[u8], dest: &mut [u8
 	}
 	// If the destination is not large enough, cannot proceed
 	if dest.len() < payload.len() {
-		return Err(Error::BadLength);
+		return Err(Error::LengthMismatch);
 	}
 	// Copy and mask the payload
 	if let Some(masking_key) = &frame_header.masking_key {
