@@ -208,7 +208,9 @@ pub enum WebSocketRx {
 	/// A fragmented message is being transmitted.
 	Frag { frag_opcode: Opcode },
 	/// A control frame was received in the middle of a fragmented message.
-	Ctrl { ctrl_opcode: Opcode, frag_opcode: Opcode },
+	FragCtrl { ctrl_opcode: Opcode, frag_opcode: Opcode },
+	/// A fragmented message has been transmitted.
+	FragFin { frag_opcode: Opcode },
 	/// A frame was received which is not valid.
 	Invalid,
 }
@@ -224,7 +226,7 @@ impl WebSocketRx {
 			// * Continue opcode is invalid, as there is no previous frame that started a fragmented message
 			// * Fin bit indicates a completed message arrived in a single frame
 			// * Otherwise a fragmented message has started, throw out any fragmented control frames
-			WebSocketRx::Init | WebSocketRx::Fin { .. } => {
+			WebSocketRx::Init | WebSocketRx::Fin { .. } | WebSocketRx::FragFin { .. } => {
 				if frame_header.opcode == Opcode::Continue {
 					WebSocketRx::Invalid
 				}
@@ -245,7 +247,7 @@ impl WebSocketRx {
 			WebSocketRx::Frag { frag_opcode } => {
 				if frame_header.opcode.is_control() {
 					if frame_header.fin {
-						WebSocketRx::Ctrl { ctrl_opcode: frame_header.opcode, frag_opcode }
+						WebSocketRx::FragCtrl { ctrl_opcode: frame_header.opcode, frag_opcode }
 					}
 					else {
 						WebSocketRx::Invalid
@@ -265,10 +267,10 @@ impl WebSocketRx {
 			},
 			// Handling a control message in between fragmented frames:
 			// 
-			WebSocketRx::Ctrl { ctrl_opcode: _, frag_opcode } => {
+			WebSocketRx::FragCtrl { ctrl_opcode: _, frag_opcode } => {
 				if frame_header.opcode.is_control() {
 					if frame_header.fin {
-						WebSocketRx::Ctrl { ctrl_opcode: frame_header.opcode, frag_opcode }
+						WebSocketRx::FragCtrl { ctrl_opcode: frame_header.opcode, frag_opcode }
 					}
 					else {
 						WebSocketRx::Invalid
