@@ -214,37 +214,33 @@ pub enum WebSocketSM {
 }
 impl WebSocketSM {
 	pub fn update<'a>(&mut self, frame_header: &FrameHeader, payload: &'a [u8]) -> Option<MsgResult<'a>> {
-		// match self {
-		// 	WebSocketSM::Handshake => None,
-		// 	WebSocketSM::Init => None,
-		// 	WebSocketSM::Fin { opcode } => Some(Msg::new(opcode, payload)),
-		// 	WebSocketSM::Frag { .. } => None,
-		// 	WebSocketSM::Ctrl { opcode, .. } => Some(Msg::new(opcode, payload)),
-		// 	WebSocketSM::Invalid => None
-		// }
-		unimplemented!()
-	}
-	pub fn next(self, frame_header: &FrameHeader) -> WebSocketSM {
-		match self {
+		match *self {
 			// The Handshake state is a convenience representing the http upgrade request
 			// It does not participate in the WebSocket state machine
-			WebSocketSM::Handshake => WebSocketSM::Invalid,
+			WebSocketSM::Handshake => {
+				*self = WebSocketSM::Invalid;
+				None
+			},
 			// From the Init and Fin state:
 			// * Continue opcode is invalid, as there is no previous frame that started a fragmented message
 			// * Fin bit indicates a completed message arrived in a single frame
 			// * Otherwise a fragmented message has started, throw out any fragmented control frames
 			WebSocketSM::Init | WebSocketSM::Fin { .. } => {
 				if frame_header.opcode == Opcode::Continue {
-					WebSocketSM::Invalid
+					*self = WebSocketSM::Invalid;
+					None
 				}
 				else if frame_header.fin {
-					WebSocketSM::Fin { opcode: frame_header.opcode }
+					*self = WebSocketSM::Fin { opcode: frame_header.opcode };
+					Some(Msg::new(frame_header.opcode, payload))
 				}
 				else if frame_header.opcode.is_control() {
-					WebSocketSM::Invalid
+					*self = WebSocketSM::Invalid;
+					None
 				}
 				else {
-					WebSocketSM::Frag { frag_opcode: frame_header.opcode }
+					*self = WebSocketSM::Frag { frag_opcode: frame_header.opcode };
+					None
 				}
 			},
 			// When expecting a fragmented message:
@@ -254,47 +250,63 @@ impl WebSocketSM {
 			WebSocketSM::Frag { frag_opcode } => {
 				if frame_header.opcode.is_control() {
 					if frame_header.fin {
-						WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode }
+						*self = WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode };
+						let payload = &payload[payload.len() - frame_header.payload_len as usize..];
+						Some(Msg::new(frame_header.opcode, payload))
 					}
 					else {
-						WebSocketSM::Invalid
+						*self = WebSocketSM::Invalid;
+						None
 					}
 				}
 				else if frame_header.opcode == Opcode::Continue {
 					if frame_header.fin {
-						WebSocketSM::Fin { opcode: frag_opcode }
+						*self = WebSocketSM::Fin { opcode: frag_opcode };
+						Some(Msg::new(frag_opcode, payload))
 					}
 					else {
-						WebSocketSM::Frag { frag_opcode }
+						*self = WebSocketSM::Frag { frag_opcode };
+						None
 					}
 				}
 				else {
-					WebSocketSM::Invalid
+					*self = WebSocketSM::Invalid;
+					None
 				}
 			},
+			// Handling a control message in between fragmented frames:
 			// 
 			WebSocketSM::Ctrl { opcode, frag_opcode } => {
 				if opcode.is_control() {
 					if frame_header.fin {
-						WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode }
+						*self = WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode };
+						let payload = &payload[payload.len() - frame_header.payload_len as usize..];
+						Some(Msg::new(frame_header.opcode, payload))
 					}
 					else {
-						WebSocketSM::Invalid
+						*self = WebSocketSM::Invalid;
+						None
 					}
 				}
 				else if frame_header.opcode == Opcode::Continue {
 					if frame_header.fin {
-						WebSocketSM::Fin { opcode: frag_opcode }
+						*self = WebSocketSM::Fin { opcode: frag_opcode };
+						Some(Msg::new(frag_opcode, payload))
 					}
 					else {
-						WebSocketSM::Frag { frag_opcode }
+						*self = WebSocketSM::Frag { frag_opcode };
+						None
 					}
 				}
 				else {
-					WebSocketSM::Invalid
+					*self = WebSocketSM::Invalid;
+					None
 				}
 			},
-			WebSocketSM::Invalid => WebSocketSM::Invalid,
+			WebSocketSM::Invalid => {
+				*self = WebSocketSM::Invalid;
+				None
+			},
 		}
 	}
 }
@@ -352,11 +364,11 @@ pub const PAYLOAD_LEN_16: u8 = 126;
 /// When the payload length field contains this value, the next 8 bytes contain the extended payload length in network endian.
 pub const PAYLOAD_LEN_64: u8 = 127;
 
-/// Minimum 16bit payload length.
+/// Minimum 16-bit payload length.
 ///
 /// The payload length must be minimally encoded, if it is any less it must be encoded as such.
 pub const PAYLOAD_LEN_MIN_16: u16 = 126;
-/// Minimum 64bit payload length.
+/// Minimum 64-bit payload length.
 ///
 /// The payload length must be minimally encoded, if it is any less it must be encoded as such.
 pub const PAYLOAD_LEN_MIN_64: u64 = 65536;
@@ -449,6 +461,23 @@ impl Default for FrameHeader {
 			payload_len: 0,
 		}
 	}
+}
+
+pub fn frame_size(frame_header: &FrameHeader) -> usize {
+	let mut len = 2; // two control words
+
+	if frame_header.payload_len >= PAYLOAD_LEN_MIN_64 {
+		len += 8;
+	}
+	else if frame_header.payload_len >= PAYLOAD_LEN_16 as u64 {
+		len += 2;
+	}
+
+	if frame_header.masking_key.is_some() {
+		len += 4;
+	}
+
+	len
 }
 
 /// Decodes a WebSocket Frame Header from the stream.
