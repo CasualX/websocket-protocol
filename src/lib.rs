@@ -196,6 +196,25 @@ impl WebSocket {
 	}
 }
 
+/// The WebSocket state machine.
+pub struct WebSocketSM {
+	fin: bool,
+	opcode: Opcode,
+}
+impl Default for WebSocketSM {
+	fn default() -> WebSocketSM {
+		WebSocketSM { fin: false, opcode: Opcode::Continue }
+	}
+}
+impl WebSocketSM {
+	pub fn new() -> WebSocketSM {
+		WebSocketSM { fin: false, opcode: Opcode::Continue }
+	}
+	pub fn update(&mut self, frame_header: &FrameHeader) -> () {
+		unimplemented!()
+	}
+}
+
 //----------------------------------------------------------------
 
 /// Operation code.
@@ -666,11 +685,34 @@ pub fn decode_frame_payload_mut(frame_header: &FrameHeader, stream: &mut [u8]) -
 
 /// Decodes a frame inplace calling the closure with the decoded frame header and its payload.
 ///
+/// If the frame is masked the payload is decoded inplace, mutating the stream.
+/// If successful ensure to throw away the number of bytes returned, do not try to decode these bytes again.
+///
 /// # Return value
 ///
 /// * Returns `Ok(n)` if the frame was successfully decoded and the closure called consuming `n` bytes from the stream.
 ///   The returned size is equal to the length of the decoded frame.
 ///
+/// * Returns `Err(WouldBlock)` if the input stream does not contain enough bytes for a complete frame.
+///   Accumulate more data from the source before trying to decode again.
+///
+/// # Examples
+///
+/// ```
+/// use websocket_protocol as wsproto;
+///
+/// // A single-frame masked text message: "Hello"
+/// let mut stream = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+///
+/// let mut asserted = false;
+/// let result = wsproto::decode_frame_mut(&mut stream, |frame_header, payload| {
+/// 	assert_eq!(b"Hello", payload);
+/// 	asserted = true;
+/// });
+///
+/// assert_eq!(Ok(stream.len()), result);
+/// assert!(asserted);
+/// ```
 pub fn decode_frame_mut<'a, F: FnMut(&FrameHeader, &'a [u8])>(stream: &'a mut [u8], mut f: F) -> Result<usize, Error> {
 	// Decode a WebSocket frame header
 	let mut frame_header = FrameHeader::default();
@@ -684,6 +726,38 @@ pub fn decode_frame_mut<'a, F: FnMut(&FrameHeader, &'a [u8])>(stream: &'a mut [u
 	Ok(header_len + payload_len)
 }
 
+/// Decodes frames inplace, calling the closure for each decoded frame and its payload.
+///
+/// Decoding stops when the inner `decode_frame_mut` returns `Err(WouldBlock)` at which the total number of consumed bytes are returned.
+/// If successful ensure to throw away the number of bytes returned, do not try to decode these bytes again.
+///
+/// # Return value
+///
+/// * Returns `Ok(n)` if all the frames were successfully decoded until an `Err(WouldBlock)` was returned.
+///   The returned size is equal to the sum of sizes of the decoded frames, if this is `0` no frames have been decoded.
+///
+/// Never returns `Err(WouldBlock)` as its purpose is to consume until all (zero or more) frames have been decoded.
+///
+/// # Examples
+///
+/// ```
+/// use websocket_protocol as wsproto;
+///
+/// // Two text frames, one masked and the other not masked, each containing a "Hello" payload
+/// let mut stream = [
+/// 	0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f,
+/// 	0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58,
+/// ];
+///
+/// let mut hits = 0;
+/// let result = wsproto::decode_frames_mut(&mut stream, |frame_header, payload| {
+/// 	assert_eq!(b"Hello", payload);
+/// 	hits += 1;
+/// });
+///
+/// assert_eq!(2, hits);
+/// assert_eq!(Ok(stream.len()), result);
+/// ```
 pub fn decode_frames_mut<'a, F: FnMut(&FrameHeader, &'a [u8])>(mut stream: &'a mut [u8], mut f: F) -> Result<usize, Error> {
 	let mut consumed = 0;
 	loop {
