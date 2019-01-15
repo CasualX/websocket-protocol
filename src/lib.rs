@@ -197,21 +197,104 @@ impl WebSocket {
 }
 
 /// The WebSocket state machine.
-pub struct WebSocketSM {
-	fin: bool,
-	opcode: Opcode,
-}
-impl Default for WebSocketSM {
-	fn default() -> WebSocketSM {
-		WebSocketSM { fin: false, opcode: Opcode::Continue }
-	}
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WebSocketSM {
+	Handshake,
+	/// Initial state on construction.
+	Init,
+	/// A completed message is available with the given opcode.
+	Fin { opcode: Opcode },
+	/// A fragmented message is being transmitted.
+	Frag { frag_opcode: Opcode },
+	/// A control frame was received in the middle of a fragmented message.
+	Ctrl { opcode: Opcode, frag_opcode: Opcode },
+	/// A frame was received which is not valid.
+	Invalid,
 }
 impl WebSocketSM {
-	pub fn new() -> WebSocketSM {
-		WebSocketSM { fin: false, opcode: Opcode::Continue }
-	}
-	pub fn update(&mut self, frame_header: &FrameHeader) -> () {
+	pub fn update(&mut self, frame_header: &FrameHeader, payload: &[u8]) -> Option<Result<Msg<'_>, str::Utf8Error>> {
+		// match self {
+		// 	WebSocketSM::Handshake => None,
+		// 	WebSocketSM::Init => None,
+		// 	WebSocketSM::Fin { opcode } => Some(Msg::new(opcode, payload)),
+		// 	WebSocketSM::Frag { .. } => None,
+		// 	WebSocketSM::Ctrl { opcode, .. } => Some(Msg::new(opcode, payload)),
+		// 	WebSocketSM::Invalid => None
+		// }
 		unimplemented!()
+	}
+	pub fn next(self, frame_header: &FrameHeader) -> WebSocketSM {
+		match self {
+			// The Handshake state is a convenience representing the http upgrade request
+			// It does not participate in the WebSocket state machine
+			WebSocketSM::Handshake => WebSocketSM::Invalid,
+			// From the Init and Fin state:
+			// * Continue opcode is invalid, as there is no previous frame that started a fragmented message
+			// * Fin bit indicates a completed message arrived in a single frame
+			// * Otherwise a fragmented message has started, throw out any fragmented control frames
+			WebSocketSM::Init | WebSocketSM::Fin { .. } => {
+				if frame_header.opcode == Opcode::Continue {
+					WebSocketSM::Invalid
+				}
+				else if frame_header.fin {
+					WebSocketSM::Fin { opcode: frame_header.opcode }
+				}
+				else if frame_header.opcode.is_control() {
+					WebSocketSM::Invalid
+				}
+				else {
+					WebSocketSM::Frag { frag_opcode: frame_header.opcode }
+				}
+			},
+			// When expecting a fragmented message:
+			// * Control frames are allowed to intersperse the fragmented message, keep track of the fragmented opcode
+			// * If not a control frame the opcode must be Continue
+			// * Fin bit indicates the final frame, otherwise expect more fragmented frames
+			WebSocketSM::Frag { frag_opcode } => {
+				if frame_header.opcode.is_control() {
+					if frame_header.fin {
+						WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode }
+					}
+					else {
+						WebSocketSM::Invalid
+					}
+				}
+				else if frame_header.opcode == Opcode::Continue {
+					if frame_header.fin {
+						WebSocketSM::Fin { opcode: frag_opcode }
+					}
+					else {
+						WebSocketSM::Frag { frag_opcode }
+					}
+				}
+				else {
+					WebSocketSM::Invalid
+				}
+			},
+			// 
+			WebSocketSM::Ctrl { opcode, frag_opcode } => {
+				if opcode.is_control() {
+					if frame_header.fin {
+						WebSocketSM::Ctrl { opcode: frame_header.opcode, frag_opcode }
+					}
+					else {
+						WebSocketSM::Invalid
+					}
+				}
+				else if frame_header.opcode == Opcode::Continue {
+					if frame_header.fin {
+						WebSocketSM::Fin { opcode: frag_opcode }
+					}
+					else {
+						WebSocketSM::Frag { frag_opcode }
+					}
+				}
+				else {
+					WebSocketSM::Invalid
+				}
+			},
+			WebSocketSM::Invalid => WebSocketSM::Invalid,
+		}
 	}
 }
 
