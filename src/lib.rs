@@ -41,7 +41,7 @@ impl<'a> Msg<'a> {
 	/// # Panics
 	///
 	/// Panics if `opcode` has the value [`Continue`](Opcode::Continue).
-	pub fn new(opcode: Opcode, payload: &'a [u8]) -> Result<Msg<'a>, str::Utf8Error> {
+	pub fn new(opcode: Opcode, payload: &'a [u8]) -> MsgResult<'a> {
 		match opcode {
 			Opcode::Continue => panic!("Cannot construct WebSocket Msg from Continue opcode"),
 			Opcode::Text => str::from_utf8(payload).map(Msg::Text),
@@ -69,6 +69,7 @@ impl<'a> Msg<'a> {
 		}
 	}
 }
+pub type MsgResult<'a> = Result<Msg<'a>, str::Utf8Error>;
 
 //----------------------------------------------------------------
 
@@ -212,7 +213,7 @@ pub enum WebSocketSM {
 	Invalid,
 }
 impl WebSocketSM {
-	pub fn update(&mut self, frame_header: &FrameHeader, payload: &[u8]) -> Option<Result<Msg<'_>, str::Utf8Error>> {
+	pub fn update<'a>(&mut self, frame_header: &FrameHeader, payload: &'a [u8]) -> Option<MsgResult<'a>> {
 		// match self {
 		// 	WebSocketSM::Handshake => None,
 		// 	WebSocketSM::Init => None,
