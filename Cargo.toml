@@ -1,10 +1,20 @@
 [package]
-name = "websocket-protocol"
-version = "0.1.0"
+name = "websock"
+version = "0.2.0"
 edition = "2018"
 
 [features]
+default = ["std"]
+
+# Enables support for stdlib and the IO traits.
 std = []
 
+# Debugging, adds print statements in various places.
+debug-print = ["std"]
+
 [dependencies]
+# httparse = "1.4"
 sha1 = "0.6"
+
+[dev-dependencies]
+urandom = "0.1"
